@@ -1,0 +1,73 @@
+package collector
+
+import (
+	"time"
+
+	"github.com/InfraWhisperer/llmtop/internal/metrics"
+)
+
+// parseSGLangMetrics extracts SGLang-specific metrics from the parsed Prometheus data.
+func parseSGLangMetrics(m *metrics.WorkerMetrics, prev *metrics.WorkerMetrics, pm *metrics.ParsedMetrics) {
+	// Running requests
+	if v, _, ok := pm.GetGaugeAny("sglang:num_running_reqs"); ok {
+		m.RequestsRunning = int(v)
+	}
+
+	// Waiting requests (queue depth)
+	if v, _, ok := pm.GetGaugeAny("sglang:num_waiting_reqs"); ok {
+		m.RequestsWaiting = int(v)
+	}
+
+	// Token usage (KV cache utilization, 0.0-1.0 → 0-100%)
+	if v, _, ok := pm.GetGaugeAny("sglang:token_usage"); ok {
+		m.KVCacheUsagePct = v * 100
+	}
+
+	// Cache hit rate (0.0-1.0 → 0-100%)
+	if v, _, ok := pm.GetGaugeAny("sglang:cache_hit_rate"); ok {
+		m.CacheHitRatePct = v * 100
+	}
+
+	// Time to first token histogram (seconds → ms)
+	if p50, ok := pm.GetHistogramQuantileAny("sglang:time_to_first_token_seconds", 0.50); ok {
+		m.TTFT_P50 = p50 * 1000
+	}
+	if p99, ok := pm.GetHistogramQuantileAny("sglang:time_to_first_token_seconds", 0.99); ok {
+		m.TTFT_P99 = p99 * 1000
+	}
+
+	// Inter-token latency histogram (seconds → ms)
+	if p50, ok := pm.GetHistogramQuantileAny("sglang:time_per_output_token_seconds", 0.50); ok {
+		m.ITL_P50 = p50 * 1000
+	}
+	if p99, ok := pm.GetHistogramQuantileAny("sglang:time_per_output_token_seconds", 0.99); ok {
+		m.ITL_P99 = p99 * 1000
+	}
+
+	// Token throughput rates
+	if prev != nil && prev.Online {
+		dt := time.Since(prev.LastSeen).Seconds()
+		if dt > 0 {
+			if v, _, ok := pm.GetGaugeAny("sglang:prompt_tokens_total"); ok {
+				m.PromptTokPerSec = (v - prev.StoreSizeBytes) / dt
+				if m.PromptTokPerSec < 0 {
+					m.PromptTokPerSec = 0
+				}
+			}
+			if v, _, ok := pm.GetGaugeAny("sglang:generation_tokens_total"); ok {
+				m.GenTokPerSec = (v - prev.EvictionTotal) / dt
+				if m.GenTokPerSec < 0 {
+					m.GenTokPerSec = 0
+				}
+			}
+		}
+	}
+
+	// Store raw counters for next rate calculation
+	if v, _, ok := pm.GetGaugeAny("sglang:prompt_tokens_total"); ok {
+		m.StoreSizeBytes = v
+	}
+	if v, _, ok := pm.GetGaugeAny("sglang:generation_tokens_total"); ok {
+		m.EvictionTotal = v
+	}
+}

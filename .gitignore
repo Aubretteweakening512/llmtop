@@ -1,0 +1,22 @@
+# Binary
+llmtop
+dist/
+bin/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test/build artifacts
+coverage.out
+*.test
+
+# Claude
+superpowers/
+plans/

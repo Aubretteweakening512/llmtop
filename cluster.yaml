@@ -1,0 +1,20 @@
+# llmtop cluster configuration example
+interval: 2
+
+endpoints:
+  - url: http://10.0.0.1:8000
+    backend: vllm
+    label: prefill-1
+  - url: http://10.0.0.2:8000
+    backend: vllm
+    label: prefill-2
+  - url: http://10.0.0.3:8000
+    backend: sglang
+    label: decode-1
+  - url: http://lmcache:8080
+    backend: lmcache
+    label: kv-cache
+  - url: http://10.0.0.5:8000
+    backend: nim
+    label: nim-pool-1
+    metrics_path: /v1/metrics
