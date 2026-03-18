@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/InfraWhisperer/llmtop/internal/metrics"
@@ -19,15 +20,18 @@ type gpuKey struct {
 	Index    int
 }
 
-// DCGMCollector polls a DCGM exporter endpoint and maintains per-GPU state.
+// DCGMCollector polls DCGM exporter endpoints and maintains per-GPU state.
+// Supports multiple fetch functions for DaemonSet deployments where each node
+// runs its own exporter.
 type DCGMCollector struct {
-	mu        sync.RWMutex
-	gpus      map[gpuKey]*metrics.GPUInfo
-	endpoint  string
-	client    *http.Client
-	interval  time.Duration
-	cancel    context.CancelFunc
-	fetchFunc func(ctx context.Context) (string, error) // optional: custom fetcher (e.g., K8s API proxy)
+	mu         sync.RWMutex
+	gpus       map[gpuKey]*metrics.GPUInfo
+	endpoint   string
+	client     *http.Client
+	interval   time.Duration
+	cancel     context.CancelFunc
+	fetchFuncs []func(ctx context.Context) (string, error) // custom fetchers (e.g., K8s API proxy per node)
+	polling    int32                                        // atomic: 1 if a poll is in progress
 }
 
 // NewDCGMCollector creates a collector targeting the given DCGM exporter base URL.
@@ -40,14 +44,15 @@ func NewDCGMCollector(endpoint string, interval time.Duration) *DCGMCollector {
 	}
 }
 
-// NewDCGMCollectorWithFetchFunc creates a collector that uses a custom fetch function
-// (e.g., K8s API server proxy) instead of direct HTTP.
-func NewDCGMCollectorWithFetchFunc(label string, interval time.Duration, fetchFunc func(ctx context.Context) (string, error)) *DCGMCollector {
+// NewDCGMCollectorWithFetchFuncs creates a collector that scrapes multiple DCGM
+// exporter pods via custom fetch functions (e.g., K8s API server proxy).
+// DCGM exporters are DaemonSets — one per GPU node — so we need one fetcher per pod.
+func NewDCGMCollectorWithFetchFuncs(label string, interval time.Duration, fetchFuncs []func(ctx context.Context) (string, error)) *DCGMCollector {
 	return &DCGMCollector{
-		gpus:      make(map[gpuKey]*metrics.GPUInfo),
-		endpoint:  label,
-		interval:  interval,
-		fetchFunc: fetchFunc,
+		gpus:       make(map[gpuKey]*metrics.GPUInfo),
+		endpoint:   label,
+		interval:   interval,
+		fetchFuncs: fetchFuncs,
 	}
 }
 
@@ -65,26 +70,63 @@ func (d *DCGMCollector) Stop() {
 	}
 }
 
-// PollNow triggers an immediate synchronous poll.
-func (d *DCGMCollector) PollNow() {
-	var body string
-	var err error
-	if d.fetchFunc != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
-		defer cancel()
-		body, err = d.fetchFunc(ctx)
-	} else {
-		body, err = d.fetchMetrics(d.endpoint + "/metrics")
+// PollNow triggers an immediate synchronous poll of all DCGM exporter pods.
+// Each pod is scraped concurrently; results are merged into the shared GPU map.
+// The provided ctx is threaded into each HTTP request so that in-flight
+// fetches are cancelled when the parent context is done.
+func (d *DCGMCollector) PollNow(ctx context.Context) {
+	if !atomic.CompareAndSwapInt32(&d.polling, 0, 1) {
+		return // poll already in progress
 	}
+	defer atomic.StoreInt32(&d.polling, 0)
+
+	if len(d.fetchFuncs) > 0 {
+		d.pollAllFetchFuncs(ctx)
+		return
+	}
+	// Direct HTTP fallback (single endpoint, no K8s proxy)
+	body, err := d.fetchMetrics(d.endpoint + "/metrics")
 	if err != nil {
-		// Graceful degradation: leave existing state intact, don't zero it out.
 		return
 	}
 	pm := metrics.ParseText(body)
-
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	parseDCGMMetrics(d.gpus, pm)
+}
+
+// pollAllFetchFuncs scrapes all DCGM exporter pods concurrently and merges.
+func (d *DCGMCollector) pollAllFetchFuncs(ctx context.Context) {
+	type result struct {
+		body string
+	}
+	results := make([]result, len(d.fetchFuncs))
+	var wg sync.WaitGroup
+
+	for i, fn := range d.fetchFuncs {
+		wg.Add(1)
+		go func(idx int, fetch func(ctx context.Context) (string, error)) {
+			defer wg.Done()
+			fetchCtx, cancel := context.WithTimeout(ctx, DefaultTimeout)
+			defer cancel()
+			body, err := fetch(fetchCtx)
+			if err != nil {
+				return
+			}
+			results[idx] = result{body: body}
+		}(i, fn)
+	}
+	wg.Wait()
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, r := range results {
+		if r.body == "" {
+			continue
+		}
+		pm := metrics.ParseText(r.body)
+		parseDCGMMetrics(d.gpus, pm)
+	}
 }
 
 // GetAll returns a snapshot of all GPU metrics sorted by (Hostname, Index).
@@ -112,7 +154,7 @@ func (d *DCGMCollector) GetSummary() metrics.GPUSummary {
 }
 
 func (d *DCGMCollector) pollLoop(ctx context.Context) {
-	d.PollNow()
+	d.PollNow(ctx)
 
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
@@ -122,7 +164,7 @@ func (d *DCGMCollector) pollLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			d.PollNow()
+			d.PollNow(ctx)
 		}
 	}
 }

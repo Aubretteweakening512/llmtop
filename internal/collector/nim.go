@@ -6,12 +6,53 @@ import (
 	"github.com/InfraWhisperer/llmtop/internal/metrics"
 )
 
+type nimParser struct{}
+
+func init() {
+	RegisterParser(metrics.BackendNIM, &nimParser{})
+	detectors = append(detectors, &nimParser{}) // MUST be last — conjunction check, not prefix
+}
+
+func (p *nimParser) Detect(pm *metrics.ParsedMetrics) (metrics.Backend, string) {
+	hasRunning := false
+	hasCachePerc := false
+	hasTTFT := false
+	var model string
+	for _, s := range pm.Samples {
+		switch s.Name {
+		case "num_requests_running":
+			hasRunning = true
+			if m, ok := s.Labels["model_name"]; ok && m != "" {
+				model = m
+			}
+		case "gpu_cache_usage_perc":
+			hasCachePerc = true
+		}
+	}
+	for _, h := range pm.Histograms {
+		if h.Name == "time_to_first_token_seconds" {
+			hasTTFT = true
+			if m, ok := h.Labels["model_name"]; ok && m != "" {
+				model = m
+			}
+		}
+	}
+	if hasRunning && hasCachePerc && hasTTFT {
+		return metrics.BackendNIM, model
+	}
+	return metrics.BackendUnknown, ""
+}
+
+func (p *nimParser) Parse(m *metrics.WorkerMetrics, prev *metrics.WorkerMetrics, prevCounters counterState, pm *metrics.ParsedMetrics) counterState {
+	return parseNIMMetrics(m, prev, prevCounters, pm)
+}
+
 // parseNIMMetrics extracts NIM-specific metrics from parsed Prometheus data.
 // NIM exports the same vLLM metrics but without the "vllm:" prefix.
 // Counter metrics (prompt_tokens_total, generation_tokens_total) are stored in
 // the Prometheus parser's Samples slice despite being typed as counters — the
 // parser does not distinguish gauge vs counter storage. This matches vllm.go behavior.
-func parseNIMMetrics(m *metrics.WorkerMetrics, prev *metrics.WorkerMetrics, pm *metrics.ParsedMetrics) {
+func parseNIMMetrics(m *metrics.WorkerMetrics, prev *metrics.WorkerMetrics, prevCounters counterState, pm *metrics.ParsedMetrics) counterState {
 	if v, _, ok := pm.GetGaugeAny("num_requests_running"); ok {
 		m.RequestsRunning = int(v)
 	}
@@ -47,18 +88,17 @@ func parseNIMMetrics(m *metrics.WorkerMetrics, prev *metrics.WorkerMetrics, pm *
 	}
 
 	// Token throughput: counter-delta rate computation.
-	// Reuses StoreSizeBytes for prompt counter, EvictionTotal for gen counter (same pattern as vllm.go).
 	if prev != nil && prev.Online {
 		dt := time.Since(prev.LastSeen).Seconds()
 		if dt > 0 {
 			if v, _, ok := pm.GetGaugeAny("prompt_tokens_total"); ok {
-				m.PromptTokPerSec = (v - prev.StoreSizeBytes) / dt
+				m.PromptTokPerSec = (v - prevCounters.promptTokensTotal) / dt
 				if m.PromptTokPerSec < 0 {
 					m.PromptTokPerSec = 0
 				}
 			}
 			if v, _, ok := pm.GetGaugeAny("generation_tokens_total"); ok {
-				m.GenTokPerSec = (v - prev.EvictionTotal) / dt
+				m.GenTokPerSec = (v - prevCounters.genTokensTotal) / dt
 				if m.GenTokPerSec < 0 {
 					m.GenTokPerSec = 0
 				}
@@ -67,10 +107,13 @@ func parseNIMMetrics(m *metrics.WorkerMetrics, prev *metrics.WorkerMetrics, pm *
 	}
 
 	// Store raw counters for next delta.
+	var counters counterState
 	if v, _, ok := pm.GetGaugeAny("prompt_tokens_total"); ok {
-		m.StoreSizeBytes = v
+		counters.promptTokensTotal = v
 	}
 	if v, _, ok := pm.GetGaugeAny("generation_tokens_total"); ok {
-		m.EvictionTotal = v
+		counters.genTokensTotal = v
 	}
+
+	return counters
 }

@@ -205,14 +205,27 @@ Same metrics as vLLM but without the `vllm:` prefix, served at `/v1/metrics`.
 
 ```
 llmtop
-├── cmd/llmtop/           Cobra CLI — flags, config loading, mode selection
+├── cmd/llmtop/           Cobra CLI — flags, config resolution, delegates to App
 ├── internal/
+│   ├── app/              Application lifecycle — owns collectors, reconcile loop, TUI/once dispatch
 │   ├── collector/        Concurrent goroutine-per-worker polling + DCGM GPU collector
+│   │   ├── interfaces.go MetricsSource / GPUSource interfaces (UI depends on these, not concrete types)
+│   │   ├── parser.go     BackendParser interface + registry (pluggable backend support)
+│   │   └── <backend>.go  Per-backend parser: Detect() + Parse(), registered via init()
 │   ├── discovery/        K8s API proxy discovery + localhost port probe fallback
+│   │   ├── target.go     Target type — boundary between discovery and collection
+│   │   └── interfaces.go Discoverer interface
 │   ├── metrics/          Hand-rolled Prometheus text parser + quantile estimation
 │   └── ui/               Bubbletea TUI — worker, GPU, model views + detail panels
 └── pkg/config/           YAML config file loading
 ```
+
+### Key design decisions
+
+- **Interfaces at every boundary.** The UI holds `MetricsSource`/`GPUSource` interfaces, not concrete collector pointers. The reconcile loop takes a `Discoverer`. This enables testing with mock sources and adding new collector types without touching the UI.
+- **BackendParser registry.** Adding a new backend is a single-file change: implement `Detect()` + `Parse()`, register in `init()`. No switch statements to update.
+- **Discovery → Collector decoupling.** Discovery produces `Target` values, callers convert to `WorkerConfig`. No import cycle between packages.
+- **Format-then-style rendering.** Table cells are formatted as plain padded strings first, then styled with ANSI colors only for unselected rows. Selected rows get a single clean style application with no embedded escape codes.
 
 No Prometheus server. No external dependencies beyond the TUI library and client-go. Metrics flow: HTTP/API-proxy → Prometheus text parse → render.
 

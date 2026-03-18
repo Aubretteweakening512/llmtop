@@ -47,7 +47,7 @@ func TestParseNIMMetrics(t *testing.T) {
 	pm := metrics.ParseText(sampleNIMMetrics)
 	m := &metrics.WorkerMetrics{Endpoint: "http://localhost:8000", Online: true}
 
-	parseNIMMetrics(m, nil, pm)
+	counters := parseNIMMetrics(m, nil, counterState{}, pm)
 
 	if m.RequestsRunning != 3 {
 		t.Errorf("RequestsRunning = %d, want 3", m.RequestsRunning)
@@ -73,17 +73,26 @@ func TestParseNIMMetrics(t *testing.T) {
 	if m.ITL_P99 <= 0 {
 		t.Errorf("ITL_P99 = %f, want > 0", m.ITL_P99)
 	}
-	if m.StoreSizeBytes != 1500 {
-		t.Errorf("StoreSizeBytes (prompt counter) = %f, want 1500", m.StoreSizeBytes)
+	// Counter values must NOT leak into WorkerMetrics fields
+	if m.StoreSizeBytes != 0 {
+		t.Errorf("StoreSizeBytes = %f, want 0 (counters should not leak into exported fields)", m.StoreSizeBytes)
 	}
-	if m.EvictionTotal != 4200 {
-		t.Errorf("EvictionTotal (gen counter) = %f, want 4200", m.EvictionTotal)
+	if m.EvictionTotal != 0 {
+		t.Errorf("EvictionTotal = %f, want 0 (counters should not leak into exported fields)", m.EvictionTotal)
+	}
+	// Counter values should be in the returned counterState
+	if counters.promptTokensTotal != 1500 {
+		t.Errorf("counters.promptTokensTotal = %f, want 1500", counters.promptTokensTotal)
+	}
+	if counters.genTokensTotal != 4200 {
+		t.Errorf("counters.genTokensTotal = %f, want 4200", counters.genTokensTotal)
 	}
 }
 
 func TestDetectBackendNIM(t *testing.T) {
 	pm := metrics.ParseText(sampleNIMMetrics)
-	backend, model := detectBackendAndModel(pm)
+	p := &nimParser{}
+	backend, model := p.Detect(pm)
 
 	if backend != metrics.BackendNIM {
 		t.Errorf("backend = %s, want NIM", backend)
@@ -98,7 +107,8 @@ func TestDetectBackendNIM_NoFalsePositive(t *testing.T) {
 num_requests_running{model_name="test"} 5
 `
 	pm := metrics.ParseText(partial)
-	backend, _ := detectBackendAndModel(pm)
+	p := &nimParser{}
+	backend, _ := p.Detect(pm)
 
 	if backend == metrics.BackendNIM {
 		t.Error("should not detect NIM with only one matching metric")

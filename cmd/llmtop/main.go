@@ -4,22 +4,37 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
-	"text/tabwriter"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
+	"k8s.io/klog/v2"
 
+	"github.com/InfraWhisperer/llmtop/internal/app"
 	"github.com/InfraWhisperer/llmtop/internal/collector"
 	"github.com/InfraWhisperer/llmtop/internal/discovery"
 	"github.com/InfraWhisperer/llmtop/internal/metrics"
-	"github.com/InfraWhisperer/llmtop/internal/ui"
 	"github.com/InfraWhisperer/llmtop/pkg/config"
 )
+
+func init() {
+	// Suppress ALL klog output to prevent client-go REST errors from corrupting
+	// the bubbletea alt screen. The flag-based approach (logtostderr, stderrthreshold)
+	// does not work with client-go v0.33+ because it uses klog v2's structured
+	// logging API (klog.FromContext(ctx).Error(...)) which bypasses flag controls.
+	//
+	// Belt and suspenders:
+	// 1. Replace klog's entire logging backend with a no-op logr.Logger.
+	//    This catches structured logging calls (logger.Error, logger.Info).
+	// 2. Redirect klog's legacy text output to io.Discard.
+	//    This catches any remaining fmt-style klog.Errorf/klog.Warningf calls.
+	klog.SetLogger(logr.Discard())
+	klog.SetOutput(io.Discard)
+}
 
 // k8sFlags holds Kubernetes-related CLI flags.
 type k8sFlags struct {
@@ -96,11 +111,12 @@ func versionCmd() *cobra.Command {
 
 func run(endpoints []string, configFile string, intervalSec int, once bool, outputFmt string, dcgmEndpoint string, kf k8sFlags) error {
 	ctx := context.Background()
+	interval := time.Duration(intervalSec) * time.Second
 
 	// Build worker configs
 	var workerConfigs []collector.WorkerConfig
 	var cfg *config.Config
-	var dcgmFetchFunc func(ctx context.Context) (string, error)
+	var dcgmFetchFuncs []func(ctx context.Context) (string, error)
 
 	if configFile != "" {
 		var err error
@@ -110,6 +126,7 @@ func run(endpoints []string, configFile string, intervalSec int, once bool, outp
 		}
 		if cfg.Interval > 0 && intervalSec == 2 {
 			intervalSec = cfg.Interval
+			interval = time.Duration(intervalSec) * time.Second
 		}
 		// Config-level DCGM endpoint; CLI flag overrides.
 		if dcgmEndpoint == "" && cfg.DCGMEndpoint != "" {
@@ -135,6 +152,7 @@ func run(endpoints []string, configFile string, intervalSec int, once bool, outp
 
 	// Kubernetes discovery: attempt if no static endpoints and not disabled
 	var k8sContext string
+	var k8sDisc *discovery.KubernetesDiscoverer
 	if !kf.noK8s && len(workerConfigs) == 0 {
 		kubecfg := kf.kubeconfig
 		if kubecfg == "" {
@@ -159,22 +177,48 @@ func run(endpoints []string, configFile string, intervalSec int, once bool, outp
 			mc = cfg.Kubernetes.MaxConcurrent
 		}
 
-		disc, err := discovery.NewKubernetesDiscoverer(kubecfg, ns, sel, mc, 2*time.Second)
+		disc, err := discovery.NewKubernetesDiscoverer(kubecfg, ns, sel, mc, 10*time.Second)
 		if err == nil {
+			k8sDisc = disc
 			k8sContext = disc.ContextName()
-			pods, discErr := disc.DiscoverPods(ctx)
-			if discErr == nil && len(pods) > 0 {
-				fmt.Fprintf(os.Stderr, "llmtop: discovered %d pods via Kubernetes (context: %s)\n", len(pods), k8sContext)
-				workerConfigs = append(workerConfigs, disc.ToWorkerConfigs(pods)...)
+
+			// Run pod discovery and DCGM discovery concurrently to cut
+			// startup latency — each involves K8s API calls that take
+			// 100-500ms per request.
+			type podResult struct {
+				pods []discovery.DiscoveredPod
+				err  error
+			}
+			type dcgmResult struct {
+				funcs []func(ctx context.Context) (string, error)
+				err   error
+			}
+			podCh := make(chan podResult, 1)
+			dcgmCh := make(chan dcgmResult, 1)
+
+			go func() {
+				pods, discErr := disc.DiscoverPods(ctx)
+				podCh <- podResult{pods, discErr}
+			}()
+
+			wantDCGM := dcgmEndpoint == "" && (cfg == nil || cfg.DCGMEndpoint == "")
+			if wantDCGM {
+				go func() {
+					funcs, dcgmErr := disc.DiscoverDCGMPods(ctx)
+					dcgmCh <- dcgmResult{funcs, dcgmErr}
+				}()
 			}
 
-			// Auto-discover DCGM exporter via K8s if no explicit dcgm endpoint
-			if dcgmEndpoint == "" && (cfg == nil || cfg.DCGMEndpoint == "") {
-				dcgmFetch, dcgmErr := disc.DiscoverDCGMPod(ctx)
-				if dcgmErr == nil {
-					fmt.Fprintln(os.Stderr, "llmtop: discovered DCGM exporter via Kubernetes")
-					dcgmEndpoint = "k8s://dcgm-exporter" // placeholder for display
-					dcgmFetchFunc = dcgmFetch
+			pr := <-podCh
+			if pr.err == nil && len(pr.pods) > 0 {
+				workerConfigs = append(workerConfigs, app.TargetsToWorkerConfigs(disc.ToTargets(pr.pods))...)
+			}
+
+			if wantDCGM {
+				dr := <-dcgmCh
+				if dr.err == nil {
+					dcgmEndpoint = "k8s://dcgm-exporter"
+					dcgmFetchFuncs = dr.funcs
 				}
 			}
 		}
@@ -188,139 +232,20 @@ func run(endpoints []string, configFile string, intervalSec int, once bool, outp
 			fmt.Fprintln(os.Stderr, "No LLM workers found. Use --endpoint, --config, or --kubeconfig to specify endpoints.")
 			fmt.Fprintln(os.Stderr, "Checked ports: 8000, 8001, 8002, 8003, 8080, 8081, 8090")
 		}
-		workerConfigs = append(workerConfigs, discovered...)
+		workerConfigs = append(workerConfigs, app.TargetsToWorkerConfigs(discovered)...)
 	}
 
-	// Create collector
-	c := collector.New(workerConfigs, time.Duration(intervalSec)*time.Second)
-
-	// Create DCGM collector if endpoint is configured or auto-discovered
-	var dc *collector.DCGMCollector
-	if dcgmFetchFunc != nil {
-		dc = collector.NewDCGMCollectorWithFetchFunc(
-			dcgmEndpoint,
-			time.Duration(intervalSec)*time.Second,
-			dcgmFetchFunc,
-		)
-	} else if dcgmEndpoint != "" {
-		dc = collector.NewDCGMCollector(
-			strings.TrimRight(dcgmEndpoint, "/"),
-			time.Duration(intervalSec)*time.Second,
-		)
-	}
-
-	if once {
-		return runOnce(ctx, c, dc, outputFmt)
-	}
-
-	return runTUI(ctx, c, dc, intervalSec, k8sContext)
-}
-
-func runOnce(ctx context.Context, c *collector.Collector, dc *collector.DCGMCollector, outputFmt string) error {
-	c.PollNow()
-	workers := c.GetAll()
-	summary := metrics.ComputeFleetSummary(workers)
-
-	if dc != nil {
-		dc.PollNow()
-	}
-
-	switch outputFmt {
-	case "json":
-		modelGroups := metrics.GroupWorkersByModel(workers)
-		envelope := struct {
-			Summary     metrics.FleetSummary     `json:"summary"`
-			Workers     []*metrics.WorkerMetrics  `json:"workers"`
-			ModelGroups []metrics.ModelGroup      `json:"model_groups,omitempty"`
-			GPUSummary  *metrics.GPUSummary       `json:"gpu_summary,omitempty"`
-			GPUs        []*metrics.GPUInfo        `json:"gpus,omitempty"`
-		}{Summary: summary, Workers: workers, ModelGroups: modelGroups}
-
-		if dc != nil {
-			gpus := dc.GetAll()
-			if len(gpus) > 0 {
-				gpuSummary := dc.GetSummary()
-				envelope.GPUSummary = &gpuSummary
-				envelope.GPUs = gpus
-			}
-		}
-
-		data, err := json.MarshalIndent(envelope, "", "  ")
-		if err != nil {
-			return err
-		}
-		fmt.Println(string(data))
-	default: // table
-		printTable(workers, summary)
-	}
-	return nil
-}
-
-func printTable(workers []*metrics.WorkerMetrics, summary metrics.FleetSummary) {
-	fmt.Printf("\nllmtop %s  ·  %d workers (%d online)  ·  %.0f tok/s  ·  cache hit %.0f%%  ·  P99 TTFT %.0fms\n\n",
-		version, summary.TotalWorkers, summary.OnlineWorkers,
-		summary.TotalTokPerSec, summary.AvgCacheHit, summary.P99TTFT)
-
-	w := tabwriter.NewWriter(os.Stdout, 2, 2, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "ENDPOINT\tBACKEND\tMODEL\tKV%\tQUEUE\tRUN\tTTFT P99\tITL P99\tHIT%\tTOK/S")
-	_, _ = fmt.Fprintln(w, strings.Repeat("─", 100))
-	for _, worker := range workers {
-		status := "●"
-		if !worker.Online {
-			status = "○"
-		}
-		var ep string
-		if strings.HasPrefix(worker.Endpoint, "k8s://") {
-			ep = worker.Label
-			if ep == "" {
-				ep = strings.TrimPrefix(worker.Endpoint, "k8s://")
-			}
-		} else {
-			ep = strings.TrimPrefix(worker.Endpoint, "http://")
-			if worker.Label != "" {
-				ep = ep + " (" + worker.Label + ")"
-			}
-		}
-		model := worker.ModelName
-		if model == "" {
-			model = "—"
-		}
-		_, _ = fmt.Fprintf(w, "%s %s\t%s\t%s\t%.0f%%\t%d\t%d\t%.0fms\t%.0fms\t%.0f%%\t%.0f\n",
-			status, ep,
-			string(worker.Backend),
-			model,
-			worker.KVCacheUsagePct,
-			worker.RequestsWaiting,
-			worker.RequestsRunning,
-			worker.TTFT_P99,
-			worker.ITL_P99,
-			worker.CacheHitRatePct,
-			worker.GenTokPerSec+worker.PromptTokPerSec,
-		)
-	}
-	_ = w.Flush() // nolint:errcheck
-}
-
-func runTUI(ctx context.Context, c *collector.Collector, dc *collector.DCGMCollector, intervalSec int, k8sContext string) error {
-	c.Start(ctx)
-	defer c.Stop()
-
-	if dc != nil {
-		dc.Start(ctx)
-		defer dc.Stop()
-	}
-
-	model := ui.NewModel(c, dc, version, intervalSec, k8sContext)
-	p := tea.NewProgram(
-		model,
-		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
-	)
-
-	if _, err := p.Run(); err != nil {
-		return fmt.Errorf("running TUI: %w", err)
-	}
-	return nil
+	return app.New(app.Options{
+		WorkerConfigs:  workerConfigs,
+		Interval:       interval,
+		DCGMEndpoint:   dcgmEndpoint,
+		DCGMFetchFuncs: dcgmFetchFuncs,
+		K8sContext:     k8sContext,
+		Discoverer:     k8sDisc,
+		Once:           once,
+		OutputFormat:   outputFmt,
+		Version:        version,
+	}).Run(ctx)
 }
 
 func parseBackend(s string) metrics.Backend {
