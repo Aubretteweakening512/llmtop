@@ -19,7 +19,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/InfraWhisperer/llmtop/internal/collector"
 	"github.com/InfraWhisperer/llmtop/internal/metrics"
 )
 
@@ -219,11 +218,6 @@ func (d *KubernetesDiscoverer) DiscoverPods(ctx context.Context) ([]DiscoveredPo
 		metricsPath := resolveMetricsPath(pod, backend)
 		gpuRequests := countGPURequests(pod)
 
-		// Dynamo workers expose metrics on port 9090
-		if isDynamo && metricsPort == 8000 {
-			metricsPort = 9090
-		}
-
 		pods = append(pods, DiscoveredPod{
 			Name:        pod.Name,
 			Namespace:   pod.Namespace,
@@ -269,16 +263,16 @@ func (d *KubernetesDiscoverer) ScrapeMetrics(ctx context.Context, pod Discovered
 	return string(raw), nil
 }
 
-// ToWorkerConfigs converts discovered pods into collector WorkerConfigs.
-// Each config's FetchFunc closure captures the discoverer and pod, routing
+// ToTargets converts discovered pods into discovery Targets.
+// Each target's FetchFunc closure captures the discoverer and pod, routing
 // metric fetches through the API server proxy.
-func (d *KubernetesDiscoverer) ToWorkerConfigs(pods []DiscoveredPod) []collector.WorkerConfig {
-	configs := make([]collector.WorkerConfig, 0, len(pods))
+func (d *KubernetesDiscoverer) ToTargets(pods []DiscoveredPod) []Target {
+	configs := make([]Target, 0, len(pods))
 	for _, pod := range pods {
 		p := pod // capture for closure
 		endpoint := fmt.Sprintf("k8s://%s/%s", p.Namespace, p.Name)
 		label := dynamoLabel(p)
-		configs = append(configs, collector.WorkerConfig{
+		configs = append(configs, Target{
 			Endpoint:    endpoint,
 			Label:       label,
 			Backend:     p.Backend,
@@ -354,13 +348,20 @@ func detectBackendFromImages(pod *corev1.Pod) (metrics.Backend, int) {
 	return metrics.BackendUnknown, 0
 }
 
-// resolveMetricsPort determines the metrics port for a pod using the priority:
-// 1. llmtop.dev/metrics-port annotation
-// 2. prometheus.io/port annotation
-// 3. Container port named "metrics" or "http"
-// 4. Known backend defaults
-// 5. Fallback: 8000
-func resolveMetricsPort(pod *corev1.Pod, backend metrics.Backend, containerIdx int) int {
+// metricsPortNames lists container port names that indicate a Prometheus
+// metrics endpoint, checked in priority order across ALL containers.
+var metricsPortNames = []string{"metrics", "prometheus", "system"}
+
+// resolveMetricsPort determines the metrics port for a pod by inspecting the
+// actual K8s pod spec rather than relying on hardcoded defaults.
+//
+// Priority:
+//  1. llmtop.dev/metrics-port annotation (explicit override)
+//  2. prometheus.io/port annotation (common convention)
+//  3. Port named "metrics", "prometheus", or "system" on ANY container
+//  4. Known backend defaults (vLLM=8000, SGLang=30000, etc.)
+//  5. Fallback: 8000
+func resolveMetricsPort(pod *corev1.Pod, backend metrics.Backend, _ int) int {
 	// Priority 1: llmtop annotation
 	if v, ok := pod.Annotations["llmtop.dev/metrics-port"]; ok {
 		if port := parsePort(v); port > 0 {
@@ -375,12 +376,15 @@ func resolveMetricsPort(pod *corev1.Pod, backend metrics.Backend, containerIdx i
 		}
 	}
 
-	// Priority 3: named container port
-	if containerIdx < len(pod.Spec.Containers) {
-		for _, p := range pod.Spec.Containers[containerIdx].Ports {
-			name := strings.ToLower(p.Name)
-			if name == "metrics" || name == "http" {
-				return int(p.ContainerPort)
+	// Priority 3: scan ALL containers for a well-known metrics port name.
+	// This handles Dynamo pods where metrics live on the "main" container's
+	// "system" port (9090), not the backend-detected container's "http" port.
+	for _, name := range metricsPortNames {
+		for i := range pod.Spec.Containers {
+			for _, p := range pod.Spec.Containers[i].Ports {
+				if strings.ToLower(p.Name) == name {
+					return int(p.ContainerPort)
+				}
 			}
 		}
 	}
@@ -417,10 +421,11 @@ func countGPURequests(pod *corev1.Pod) int64 {
 	return total
 }
 
-// DiscoverDCGMPod searches for a DCGM exporter pod in well-known namespaces
-// (gpu-operator, monitoring, kube-system) and returns a FetchFunc that scrapes
-// it via the API server proxy. Returns nil if no DCGM exporter is found.
-func (d *KubernetesDiscoverer) DiscoverDCGMPod(ctx context.Context) (func(ctx context.Context) (string, error), error) {
+// DiscoverDCGMPods searches for DCGM exporter pods across well-known namespaces
+// (gpu-operator, monitoring, kube-system) and returns a FetchFunc per pod.
+// DCGM exporters run as DaemonSets — one per GPU node — so we must scrape all
+// of them to get a complete picture of the cluster's GPUs.
+func (d *KubernetesDiscoverer) DiscoverDCGMPods(ctx context.Context) ([]func(ctx context.Context) (string, error), error) {
 	dcgmNamespaces := []string{"gpu-operator", "monitoring", "kube-system"}
 	if d.namespace != "" {
 		dcgmNamespaces = append([]string{d.namespace}, dcgmNamespaces...)
@@ -430,6 +435,9 @@ func (d *KubernetesDiscoverer) DiscoverDCGMPod(ctx context.Context) (func(ctx co
 		"app=nvidia-dcgm-exporter",
 		"app.kubernetes.io/name=dcgm-exporter",
 	}
+
+	var fetchFuncs []func(ctx context.Context) (string, error)
+	seen := make(map[string]struct{}) // dedup by pod name
 
 	for _, ns := range dcgmNamespaces {
 		for _, sel := range dcgmSelectors {
@@ -444,29 +452,41 @@ func (d *KubernetesDiscoverer) DiscoverDCGMPod(ctx context.Context) (func(ctx co
 				if pod.Status.Phase != corev1.PodRunning || !isPodReady(pod) {
 					continue
 				}
-				// DCGM exporter default port is 9400
-				port := 9400
-				for _, c := range pod.Spec.Containers {
-					for _, p := range c.Ports {
-						if p.Name == "metrics" || p.ContainerPort == 9400 {
-							port = int(p.ContainerPort)
-						}
-					}
+				if _, dup := seen[pod.Name]; dup {
+					continue
 				}
+				seen[pod.Name] = struct{}{}
+
+				port := resolveDCGMPort(pod)
 				dcgmPod := DiscoveredPod{
 					Name:        pod.Name,
 					Namespace:   pod.Namespace,
 					MetricsPort: port,
 					MetricsPath: "/metrics",
 				}
-				return func(ctx context.Context) (string, error) {
+				fetchFuncs = append(fetchFuncs, func(ctx context.Context) (string, error) {
 					return d.ScrapeMetrics(ctx, dcgmPod)
-				}, nil
+				})
 			}
 		}
 	}
 
-	return nil, fmt.Errorf("no DCGM exporter pod found")
+	if len(fetchFuncs) == 0 {
+		return nil, fmt.Errorf("no DCGM exporter pods found")
+	}
+	return fetchFuncs, nil
+}
+
+// resolveDCGMPort extracts the metrics port from a DCGM exporter pod spec.
+func resolveDCGMPort(pod *corev1.Pod) int {
+	for _, c := range pod.Spec.Containers {
+		for _, p := range c.Ports {
+			if p.Name == "metrics" || p.ContainerPort == 9400 {
+				return int(p.ContainerPort)
+			}
+		}
+	}
+	return 9400
 }
 
 // parsePort converts a string to a port number, returning 0 on failure.

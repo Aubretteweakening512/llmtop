@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
+
 	"github.com/InfraWhisperer/llmtop/internal/metrics"
 )
 
@@ -20,8 +22,10 @@ const (
 	colTok     = 7
 )
 
-// fixedWidth is the sum of all fixed columns + inter-column spaces + left margin
-var fixedWidth = colBackend + colKV + colQueue + colRun + colTTFT + colITL + colHit + colTok + 12 // 12 = spaces + dot + margins
+// fixedWidth is the sum of all fixed columns + inter-column spaces + left margin + dot.
+// Layout: "  " (2) + dot (1) + " " (1) + ep + " " + backend + " " + model + " " + kv + " " + queue + " " + run + " " + ttft + " " + itl + " " + hit + " " + tok
+// Overhead: 2 (margin) + 1 (dot) + 1 (space) + 9 (inter-column spaces) = 13
+var fixedWidth = colBackend + colKV + colQueue + colRun + colTTFT + colITL + colHit + colTok + 13
 
 // flexWidths computes dynamic ENDPOINT and MODEL column widths from terminal width.
 func flexWidths(termWidth int) (epW, modelW int) {
@@ -66,7 +70,7 @@ func SortColumnName(s SortColumn) string {
 	case SortTokPerSec:
 		return "Tok/s"
 	default:
-		return "—"
+		return "-"
 	}
 }
 
@@ -79,8 +83,8 @@ func RenderTable(workers []*metrics.WorkerMetrics, selectedIdx int, sortCol Sort
 	sb.WriteString(header)
 	sb.WriteString("\n")
 
-	sep := StyleTableSeparator.Render(strings.Repeat("─", max(width-2, 80)))
-	sb.WriteString("  " + sep)
+	sep := StyleTableSeparator.Render(strings.Repeat("-", max(width-4, 80)))
+	sb.WriteString("    " + sep)
 	sb.WriteString("\n")
 
 	for i, w := range workers {
@@ -122,7 +126,8 @@ func renderTableHeader(sortCol SortColumn, epW, modelW int) string {
 			parts = append(parts, StyleTableHeader.Render(text))
 		}
 	}
-	return "  " + strings.Join(parts, " ")
+	// 4-char prefix: "  " (margin) + "  " (dot placeholder) to align with data rows
+	return "    " + strings.Join(parts, " ")
 }
 
 func renderWorkerRow(w *metrics.WorkerMetrics, selected bool, epW, modelW int) string {
@@ -147,127 +152,166 @@ func renderWorkerRow(w *metrics.WorkerMetrics, selected bool, epW, modelW int) s
 			ep = ep + " (" + w.Label + ")"
 		}
 	}
-	epStr := padRight(truncate(ep, epW-2), epW-2)
-
-	backendStr := renderBackend(w.Backend, colBackend)
+	epStr := padRight(truncate(ep, epW), epW)
 
 	model := w.ModelName
 	if model == "" {
-		model = "—"
+		model = "-"
 	}
 	modelStr := padRight(truncate(model, modelW), modelW)
 
 	if !w.Online {
+		// Offline row: all metric columns show "Err", no per-cell styling needed
+		backendStr := padRight(string(w.Backend), colBackend)
 		row := "  " + dot + " " + epStr + " " + backendStr + " " + modelStr + " " +
-			padRight("—", colKV) + " " +
-			padRight("—", colQueue) + " " +
-			padRight("—", colRun) + " " +
-			padRight("—", colTTFT) + " " +
-			padRight("—", colITL) + " " +
-			padRight("—", colHit) + " " +
-			padRight("—", colTok)
+			padRight("Err", colKV) + " " + padRight("Err", colQueue) + " " + padRight("Err", colRun) + " " +
+			padRight("Err", colTTFT) + " " + padRight("Err", colITL) + " " +
+			padRight("Err", colHit) + " " + padRight("Err", colTok)
 		if selected {
 			return StyleTableRowSelected.Render(row)
 		}
 		return StyleTableRowOffline.Render(row)
 	}
 
-	kvStr := renderKVCache(w.KVCacheUsagePct, colKV)
-	queueStr := renderQueue(w.RequestsWaiting, colQueue)
-	runStr := padRight(fmt.Sprintf("%d", w.RequestsRunning), colRun)
-	ttftStr := renderTTFT(w.TTFT_P99, colTTFT)
-	itlStr := renderTTFT(w.ITL_P99, colITL)
-	hitStr := renderHitRate(w.CacheHitRatePct, colHit)
-	tokStr := renderTokPerSec(w.GenTokPerSec+w.PromptTokPerSec, colTok)
+	// Format all values as plain padded strings first — style applied at the end
+	backendPlain := padRight(string(w.Backend), colBackend)
+	kvPlain := formatKVCache(w.KVCacheUsagePct, colKV)
+	queuePlain := formatQueue(w.RequestsWaiting, colQueue)
+	runPlain := padRight(fmt.Sprintf("%d", w.RequestsRunning), colRun)
+	ttftPlain := formatTTFT(w.TTFT_P99, colTTFT)
+	itlPlain := formatTTFT(w.ITL_P99, colITL)
+	hitPlain := formatHitRate(w.CacheHitRatePct, colHit)
+	tokPlain := formatTokPerSec(w.GenTokPerSec+w.PromptTokPerSec, colTok)
 
 	if selected {
-		plain := "  " + dot + " " + stripStyle(epStr) + " " + stripStyle(backendStr) + " " +
-			stripStyle(modelStr) + " " + stripStyle(kvStr) + " " + stripStyle(queueStr) + " " +
-			stripStyle(runStr) + " " + stripStyle(ttftStr) + " " + stripStyle(itlStr) + " " +
-			stripStyle(hitStr) + " " + stripStyle(tokStr)
+		plain := "  " + dot + " " + epStr + " " + backendPlain + " " + modelStr + " " +
+			kvPlain + " " + queuePlain + " " + runPlain + " " + ttftPlain + " " + itlPlain + " " +
+			hitPlain + " " + tokPlain
 		return StyleTableRowSelected.Render(plain)
 	}
 
-	return "  " + dot + " " + epStr + " " + backendStr + " " + modelStr + " " +
-		kvStr + " " + queueStr + " " + runStr + " " + ttftStr + " " + itlStr + " " + hitStr + " " + tokStr
+	// Unselected: apply per-cell color styles
+	return "  " + dot + " " + epStr + " " +
+		backendStyle(w.Backend).Render(backendPlain) + " " +
+		modelStr + " " +
+		kvCacheStyle(w.KVCacheUsagePct, kvPlain) + " " +
+		queueStyle(w.RequestsWaiting, queuePlain) + " " +
+		runPlain + " " +
+		ttftStyle(w.TTFT_P99, ttftPlain) + " " +
+		ttftStyle(w.ITL_P99, itlPlain) + " " +
+		hitRateStyle(w.CacheHitRatePct, hitPlain) + " " +
+		tokPerSecStyle(w.GenTokPerSec+w.PromptTokPerSec, tokPlain)
 }
 
-func renderBackend(b metrics.Backend, width int) string {
-	var style lipgloss.Style
+// --- Plain formatting functions (no ANSI, just padded strings) ---
+
+func formatKVCache(pct float64, width int) string {
+	if pct == 0 {
+		return padRight("-", width)
+	}
+	return padRight(fmt.Sprintf("%.0f%%", pct), width)
+}
+
+func formatQueue(n int, width int) string {
+	return padRight(fmt.Sprintf("%d", n), width)
+}
+
+func formatTTFT(ms float64, width int) string {
+	if ms == 0 {
+		return padRight("-", width)
+	}
+	return padRight(fmt.Sprintf("%.0fms", ms), width)
+}
+
+func formatHitRate(pct float64, width int) string {
+	if pct == 0 {
+		return padRight("-", width)
+	}
+	return padRight(fmt.Sprintf("%.0f%%", pct), width)
+}
+
+func formatTokPerSec(tok float64, width int) string {
+	if tok == 0 {
+		return padRight("-", width)
+	}
+	return padRight(fmt.Sprintf("%.0f", tok), width)
+}
+
+// --- Style application functions (take plain string, return styled) ---
+
+func backendStyle(b metrics.Backend) lipgloss.Style {
 	switch b {
 	case metrics.BackendVLLM:
-		style = StyleBadgeVLLM
+		return StyleBadgeVLLM
 	case metrics.BackendSGLang:
-		style = StyleBadgeSGLang
+		return StyleBadgeSGLang
 	case metrics.BackendLMCache:
-		style = StyleBadgeLMCache
+		return StyleBadgeLMCache
 	case metrics.BackendNIM:
-		style = StyleBadgeNIM
+		return StyleBadgeNIM
 	default:
-		style = StyleBadgeUnknown
+		return StyleBadgeUnknown
 	}
-	return style.Render(padRight(string(b), width))
 }
 
-func renderKVCache(pct float64, width int) string {
+func kvCacheStyle(pct float64, plain string) string {
 	if pct == 0 {
-		return StyleMetricNA.Render(padRight("—", width))
+		return StyleMetricNA.Render(plain)
 	}
-	s := fmt.Sprintf("%.0f%%", pct)
-	return KVCacheStyle(pct).Render(padRight(s, width))
+	return KVCacheStyle(pct).Render(plain)
 }
 
-func renderQueue(n int, width int) string {
+func queueStyle(n int, plain string) string {
 	if n == 0 {
-		return StyleMetricGood.Render(padRight("0", width))
+		return StyleMetricGood.Render(plain)
 	}
-	s := fmt.Sprintf("%d", n)
-	return QueueStyle(n).Render(padRight(s, width))
+	return QueueStyle(n).Render(plain)
 }
 
-func renderTTFT(ms float64, width int) string {
+func ttftStyle(ms float64, plain string) string {
 	if ms == 0 {
-		return StyleMetricNA.Render(padRight("—", width))
+		return StyleMetricNA.Render(plain)
 	}
-	s := fmt.Sprintf("%.0fms", ms)
-	return TTFTStyle(ms).Render(padRight(s, width))
+	return TTFTStyle(ms).Render(plain)
 }
 
-func renderHitRate(pct float64, width int) string {
+func hitRateStyle(pct float64, plain string) string {
 	if pct == 0 {
-		return StyleMetricNA.Render(padRight("—", width))
+		return StyleMetricNA.Render(plain)
 	}
-	s := fmt.Sprintf("%.0f%%", pct)
-	return StyleMetricGood.Render(padRight(s, width))
+	return StyleMetricGood.Render(plain)
 }
 
-func renderTokPerSec(tok float64, width int) string {
+func tokPerSecStyle(tok float64, plain string) string {
 	if tok == 0 {
-		return StyleMetricNA.Render(padRight("—", width))
+		return StyleMetricNA.Render(plain)
 	}
-	s := fmt.Sprintf("%.0f", tok)
-	return StyleMetricGood.Render(padRight(s, width))
+	return StyleMetricGood.Render(plain)
 }
 
+// --- Width-correct string utilities ---
+
+// padRight pads a string with spaces to the given display width.
+// Uses runewidth for correct handling of multi-byte characters (em-dash, CJK, etc).
 func padRight(s string, n int) string {
-	if len(s) >= n {
+	w := runewidth.StringWidth(s)
+	if w >= n {
 		return s
 	}
-	return s + strings.Repeat(" ", n-len(s))
+	return s + strings.Repeat(" ", n-w)
 }
 
+// truncate truncates a string to fit within n display columns.
+// Uses runewidth for correct handling of multi-byte characters.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	w := runewidth.StringWidth(s)
+	if w <= n {
 		return s
 	}
 	if n > 3 {
-		return s[:n-3] + "..."
+		return runewidth.Truncate(s, n-3, "") + "..."
 	}
-	return s[:n]
-}
-
-func stripStyle(s string) string {
-	return s
+	return runewidth.Truncate(s, n, "")
 }
 
 func max(a, b int) int {

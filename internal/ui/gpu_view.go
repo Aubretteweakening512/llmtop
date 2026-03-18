@@ -10,7 +10,7 @@ import (
 
 // GPU table column widths
 const (
-	colGPUIdx   = 5
+	colGPUIdx   = 16
 	colGPUName  = 26
 	colGPUUtil  = 7
 	colGPUVRAM  = 16
@@ -128,47 +128,41 @@ func renderGPUTableHeader() string {
 }
 
 func renderGPURow(g *metrics.GPUInfo, selected bool) string {
-	// GPU index
-	idxStr := padRight(fmt.Sprintf("%d", g.Index), colGPUIdx)
-
-	// Name
+	// GPU index with hostname for multi-node disambiguation
+	idxLabel := fmt.Sprintf("%d", g.Index)
+	if g.Hostname != "" {
+		idxLabel = g.Hostname + "/" + idxLabel
+	}
+	idxStr := padRight(truncate(idxLabel, colGPUIdx), colGPUIdx)
 	nameStr := padRight(truncate(g.Name, colGPUName), colGPUName)
+	utilPlain := padRight(fmt.Sprintf("%.0f%%", g.UtilPct), colGPUUtil)
 
-	// Utilization
-	utilStr := GPUUtilStyle(g.UtilPct).Render(padRight(fmt.Sprintf("%.0f%%", g.UtilPct), colGPUUtil))
-
-	// VRAM used/total
 	var vramPct float64
 	if g.MemTotalMB > 0 {
 		vramPct = (g.MemUsedMB / g.MemTotalMB) * 100
 	}
-	vramText := fmt.Sprintf("%.1f/%.1f GiB", g.MemUsedMB/1024, g.MemTotalMB/1024)
-	vramStr := VRAMStyle(vramPct).Render(padRight(truncate(vramText, colGPUVRAM), colGPUVRAM))
-
-	// Temp
-	tempStr := GPUTempStyle(g.TempC).Render(padRight(fmt.Sprintf("%.0f°C", g.TempC), colGPUTemp))
-
-	// Power
-	powerStr := StyleMetricGood.Render(padRight(fmt.Sprintf("%.0fW", g.PowerW), colGPUPower))
-
-	// Pod
-	pod := gpuPodLabel(g)
-	podStr := padRight(truncate(pod, colGPUPod), colGPUPod)
+	vramPlain := padRight(truncate(fmt.Sprintf("%.1f/%.1f GiB", g.MemUsedMB/1024, g.MemTotalMB/1024), colGPUVRAM), colGPUVRAM)
+	tempPlain := padRight(fmt.Sprintf("%.0f°C", g.TempC), colGPUTemp)
+	powerPlain := padRight(fmt.Sprintf("%.0fW", g.PowerW), colGPUPower)
+	podStr := padRight(truncate(gpuPodLabel(g), colGPUPod), colGPUPod)
 
 	if selected {
-		plain := "  " + stripStyle(idxStr) + " " + stripStyle(nameStr) + " " +
-			stripStyle(utilStr) + " " + stripStyle(vramStr) + " " +
-			stripStyle(tempStr) + " " + stripStyle(powerStr) + " " + stripStyle(podStr)
+		plain := "  " + idxStr + " " + nameStr + " " +
+			utilPlain + " " + vramPlain + " " +
+			tempPlain + " " + powerPlain + " " + podStr
 		return StyleTableRowSelected.Render(plain)
 	}
 
-	return "  " + idxStr + " " + nameStr + " " + utilStr + " " + vramStr + " " +
-		tempStr + " " + powerStr + " " + podStr
+	return "  " + idxStr + " " + nameStr + " " +
+		GPUUtilStyle(g.UtilPct).Render(utilPlain) + " " +
+		VRAMStyle(vramPct).Render(vramPlain) + " " +
+		GPUTempStyle(g.TempC).Render(tempPlain) + " " +
+		StyleMetricGood.Render(powerPlain) + " " + podStr
 }
 
 func gpuPodLabel(g *metrics.GPUInfo) string {
 	if g.Pod == "" {
-		return "—"
+		return "-"
 	}
 	if g.Namespace != "" {
 		return g.Namespace + "/" + g.Pod

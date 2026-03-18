@@ -6,8 +6,6 @@ import (
 	"context"
 	"fmt"
 	"time"
-
-	"github.com/InfraWhisperer/llmtop/internal/collector"
 )
 
 // KubernetesDiscoverer is a stub when built with the nokubernetes tag.
@@ -29,12 +27,12 @@ func (d *KubernetesDiscoverer) DiscoverPods(_ context.Context) ([]DiscoveredPod,
 	return nil, fmt.Errorf("kubernetes discovery disabled")
 }
 
-// ToWorkerConfigs returns nil in the stub build.
-func (d *KubernetesDiscoverer) ToWorkerConfigs(_ []DiscoveredPod) []collector.WorkerConfig {
+// ToTargets returns nil in the stub build.
+func (d *KubernetesDiscoverer) ToTargets(_ []DiscoveredPod) []Target {
 	return nil
 }
 
-// DiscoverDCGMPod returns an error in the stub build.
-func (d *KubernetesDiscoverer) DiscoverDCGMPod(_ context.Context) (func(context.Context) (string, error), error) {
+// DiscoverDCGMPods returns an error in the stub build.
+func (d *KubernetesDiscoverer) DiscoverDCGMPods(_ context.Context) ([]func(context.Context) (string, error), error) {
 	return nil, fmt.Errorf("kubernetes discovery disabled")
 }

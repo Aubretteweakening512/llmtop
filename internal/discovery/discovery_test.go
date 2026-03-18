@@ -1,0 +1,67 @@
+package discovery
+
+import (
+	"testing"
+
+	"github.com/InfraWhisperer/llmtop/internal/metrics"
+)
+
+func TestDetectBackend_VLLM(t *testing.T) {
+	body := `vllm:num_requests_running{model_name="test"} 5`
+	got := detectBackend(body)
+	if got != metrics.BackendVLLM {
+		t.Errorf("expected BackendVLLM, got %s", got)
+	}
+}
+
+func TestDetectBackend_SGLang(t *testing.T) {
+	body := `sglang:num_running_reqs{} 3`
+	got := detectBackend(body)
+	if got != metrics.BackendSGLang {
+		t.Errorf("expected BackendSGLang, got %s", got)
+	}
+}
+
+func TestDetectBackend_LMCache(t *testing.T) {
+	body := `lmcache_hit_rate 0.5`
+	got := detectBackend(body)
+	if got != metrics.BackendLMCache {
+		t.Errorf("expected BackendLMCache, got %s", got)
+	}
+}
+
+func TestDetectBackend_NIM(t *testing.T) {
+	body := "num_requests_running{model_name=\"nim-model\"} 2\n" +
+		"gpu_cache_usage_perc 0.45\n" +
+		"# HELP time_to_first_token_seconds TTFT\n" +
+		"time_to_first_token_seconds_bucket{le=\"0.1\"} 10\n"
+	got := detectBackend(body)
+	if got != metrics.BackendNIM {
+		t.Errorf("expected BackendNIM, got %s", got)
+	}
+}
+
+func TestDetectBackend_NIM_Partial(t *testing.T) {
+	// Only 2 of 3 NIM signals — should not match.
+	body := "num_requests_running{model_name=\"nim-model\"} 2\n" +
+		"gpu_cache_usage_perc 0.45\n"
+	got := detectBackend(body)
+	if got != metrics.BackendUnknown {
+		t.Errorf("expected BackendUnknown for partial NIM signals, got %s", got)
+	}
+}
+
+func TestDetectBackend_Unknown(t *testing.T) {
+	body := "some_random_metric 42\nanother_metric 7\n"
+	got := detectBackend(body)
+	if got != metrics.BackendUnknown {
+		t.Errorf("expected BackendUnknown, got %s", got)
+	}
+}
+
+func TestDetectBackend_Empty(t *testing.T) {
+	got := detectBackend("")
+	if got != metrics.BackendUnknown {
+		t.Errorf("expected BackendUnknown for empty input, got %s", got)
+	}
+}

@@ -6,8 +6,33 @@ import (
 	"github.com/InfraWhisperer/llmtop/internal/metrics"
 )
 
+type vllmParser struct{}
+
+func init() {
+	RegisterParser(metrics.BackendVLLM, &vllmParser{})
+	detectors = append(detectors, &vllmParser{})
+}
+
+func (p *vllmParser) Detect(pm *metrics.ParsedMetrics) (metrics.Backend, string) {
+	for _, s := range pm.Samples {
+		if len(s.Name) >= 5 && s.Name[:5] == "vllm:" {
+			return metrics.BackendVLLM, s.Labels["model_name"]
+		}
+	}
+	for _, h := range pm.Histograms {
+		if len(h.Name) >= 5 && h.Name[:5] == "vllm:" {
+			return metrics.BackendVLLM, h.Labels["model_name"]
+		}
+	}
+	return metrics.BackendUnknown, ""
+}
+
+func (p *vllmParser) Parse(m *metrics.WorkerMetrics, prev *metrics.WorkerMetrics, prevCounters counterState, pm *metrics.ParsedMetrics) counterState {
+	return parseVLLMMetrics(m, prev, prevCounters, pm)
+}
+
 // parseVLLMMetrics extracts vLLM-specific metrics from the parsed Prometheus data.
-func parseVLLMMetrics(m *metrics.WorkerMetrics, prev *metrics.WorkerMetrics, pm *metrics.ParsedMetrics) {
+func parseVLLMMetrics(m *metrics.WorkerMetrics, prev *metrics.WorkerMetrics, prevCounters counterState, pm *metrics.ParsedMetrics) counterState {
 	// Running requests
 	if v, _, ok := pm.GetGaugeAny("vllm:num_requests_running"); ok {
 		m.RequestsRunning = int(v)
@@ -65,16 +90,13 @@ func parseVLLMMetrics(m *metrics.WorkerMetrics, prev *metrics.WorkerMetrics, pm 
 		dt := time.Since(prev.LastSeen).Seconds()
 		if dt > 0 {
 			if v, _, ok := pm.GetGaugeAny("vllm:prompt_tokens_total"); ok {
-				if prev.PromptTokPerSec > 0 || true {
-					// prev throughput is stored, recalculate if we have the raw counter
-					m.PromptTokPerSec = (v - prevPromptTokensVLLM(prev)) / dt
-					if m.PromptTokPerSec < 0 {
-						m.PromptTokPerSec = 0
-					}
+				m.PromptTokPerSec = (v - prevCounters.promptTokensTotal) / dt
+				if m.PromptTokPerSec < 0 {
+					m.PromptTokPerSec = 0
 				}
 			}
 			if v, _, ok := pm.GetGaugeAny("vllm:generation_tokens_total"); ok {
-				m.GenTokPerSec = (v - prevGenTokensVLLM(prev)) / dt
+				m.GenTokPerSec = (v - prevCounters.genTokensTotal) / dt
 				if m.GenTokPerSec < 0 {
 					m.GenTokPerSec = 0
 				}
@@ -82,20 +104,32 @@ func parseVLLMMetrics(m *metrics.WorkerMetrics, prev *metrics.WorkerMetrics, pm 
 		}
 	}
 
-	// Store raw counters in a way we can compute rates next time
-	// We repurpose EvictionTotal/StoreSizeBytes fields for counter storage
+	// Store raw counters for next rate calculation
+	var counters counterState
 	if v, _, ok := pm.GetGaugeAny("vllm:prompt_tokens_total"); ok {
-		m.StoreSizeBytes = v // reuse for prompt counter
+		counters.promptTokensTotal = v
 	}
 	if v, _, ok := pm.GetGaugeAny("vllm:generation_tokens_total"); ok {
-		m.EvictionTotal = v // reuse for gen counter
+		counters.genTokensTotal = v
 	}
-}
 
-func prevPromptTokensVLLM(prev *metrics.WorkerMetrics) float64 {
-	return prev.StoreSizeBytes
-}
+	// Dynamo runtime augmentation: Dynamo pods emit dynamo_component_* metrics
+	// alongside vllm:* metrics. Use them as fallbacks when the vllm: gauge is
+	// missing (e.g., future Dynamo versions that drop the vllm: prefix).
+	if m.KVCacheUsagePct == 0 {
+		if v, _, ok := pm.GetGaugeAny("dynamo_component_gpu_cache_usage_percent"); ok {
+			m.KVCacheUsagePct = v * 100
+		}
+	}
+	if m.RequestsRunning == 0 {
+		if v, labels, ok := pm.GetGaugeAny("dynamo_component_inflight_requests"); ok {
+			// Only count the "generate" endpoint — other endpoints (kv_indexer,
+			// clear_kv_blocks) are internal Dynamo RPCs, not user requests.
+			if labels["dynamo_endpoint"] == "generate" {
+				m.RequestsRunning = int(v)
+			}
+		}
+	}
 
-func prevGenTokensVLLM(prev *metrics.WorkerMetrics) float64 {
-	return prev.EvictionTotal
+	return counters
 }

@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/InfraWhisperer/llmtop/internal/collector"
 	"github.com/InfraWhisperer/llmtop/internal/metrics"
 )
 
@@ -26,19 +25,19 @@ type DiscoverResult struct {
 
 // DiscoverLocal probes localhost on all DefaultPorts concurrently.
 // Returns discovered worker configs.
-func DiscoverLocal(ctx context.Context) []collector.WorkerConfig {
+func DiscoverLocal(ctx context.Context) []Target {
 	return DiscoverPorts(ctx, "localhost", DefaultPorts)
 }
 
 // DiscoverPorts probes the given host:ports concurrently. It first tries /metrics;
 // if that fails (connection error or non-200), it falls back to /v1/metrics for NIM.
 // Only ports that return a recognised backend are included in the results.
-func DiscoverPorts(ctx context.Context, host string, ports []int) []collector.WorkerConfig {
+func DiscoverPorts(ctx context.Context, host string, ports []int) []Target {
 	client := &http.Client{
 		Timeout: 500 * time.Millisecond,
 	}
 
-	results := make(chan collector.WorkerConfig, len(ports))
+	results := make(chan Target, len(ports))
 	var wg sync.WaitGroup
 
 	for _, port := range ports {
@@ -52,7 +51,7 @@ func DiscoverPorts(ctx context.Context, host string, ports []int) []collector.Wo
 			if err == nil {
 				backend := detectBackend(body)
 				if backend != metrics.BackendUnknown {
-					results <- collector.WorkerConfig{
+					results <- Target{
 						Endpoint:    endpoint,
 						Backend:     backend,
 						MetricsPath: "/metrics",
@@ -66,7 +65,7 @@ func DiscoverPorts(ctx context.Context, host string, ports []int) []collector.Wo
 			if err == nil {
 				backend := detectBackend(body)
 				if backend != metrics.BackendUnknown {
-					results <- collector.WorkerConfig{
+					results <- Target{
 						Endpoint:    endpoint,
 						Backend:     backend,
 						MetricsPath: "/v1/metrics",
@@ -82,7 +81,7 @@ func DiscoverPorts(ctx context.Context, host string, ports []int) []collector.Wo
 		close(results)
 	}()
 
-	var configs []collector.WorkerConfig
+	var configs []Target
 	for cfg := range results {
 		configs = append(configs, cfg)
 	}
@@ -111,10 +110,14 @@ func probeEndpoint(ctx context.Context, client *http.Client, url string) (string
 	return string(body), nil
 }
 
-// detectBackend identifies the backend type from Prometheus metric content.
-// Prefixed backends (vllm:, sglang:, lmcache_) are detected by line prefix.
-// NIM is identified by the conjunction of three unprefixed metrics it always exposes:
-// num_requests_running, gpu_cache_usage_perc, and time_to_first_token_seconds.
+// detectBackend identifies the backend type from raw Prometheus metric text.
+// This is a fast line-prefix heuristic used during port-scan discovery.
+// The authoritative detection lives in BackendParser.Detect() implementations
+// in the collector package, which operate on parsed samples.
+//
+// IMPORTANT: When adding a new backend, update BOTH this heuristic AND
+// the corresponding BackendParser.Detect() in internal/collector/.
+// Registered backends: vLLM (vllm:), SGLang (sglang:), LMCache (lmcache_), NIM (conjunction).
 func detectBackend(body string) metrics.Backend {
 	hasRunning := false
 	hasCachePerc := false

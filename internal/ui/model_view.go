@@ -64,7 +64,7 @@ func ModelSortColumnName(s ModelSortColumn) string {
 	case ModelSortAvgTTFT:
 		return "Avg TTFT"
 	default:
-		return "—"
+		return "-"
 	}
 }
 
@@ -173,51 +173,30 @@ func renderModelTableHeader(sortCol ModelSortColumn, modelW int) string {
 
 func renderModelGroupRow(g metrics.ModelGroup, selected bool, modelW int) string {
 	modelStr := padRight(truncate(g.ModelName, modelW), modelW)
-	backendStr := renderBackend(g.Backend, colMGBackend)
-
-	workersText := fmt.Sprintf("%d/%d", g.OnlineWorkers, g.Workers)
-	workersStr := padRight(workersText, colMGWorkers)
-
-	var tokStr string
-	if g.TotalTokPerSec == 0 {
-		tokStr = StyleMetricNA.Render(padRight("—", colMGTok))
-	} else {
-		tokStr = StyleMetricGood.Render(padRight(fmt.Sprintf("%.0f", g.TotalTokPerSec), colMGTok))
-	}
-
-	var kvStr string
-	if g.AvgKVCachePct == 0 {
-		kvStr = StyleMetricNA.Render(padRight("—", colMGAvgKV))
-	} else {
-		kvStr = KVCacheStyle(g.AvgKVCachePct).Render(padRight(fmt.Sprintf("%.0f%%", g.AvgKVCachePct), colMGAvgKV))
-	}
-
-	queueStr := renderQueue(g.TotalQueue, colMGQueue)
+	backendPlain := padRight(string(g.Backend), colMGBackend)
+	workersStr := padRight(fmt.Sprintf("%d/%d", g.OnlineWorkers, g.Workers), colMGWorkers)
+	tokPlain := formatTokPerSec(g.TotalTokPerSec, colMGTok)
+	kvPlain := formatKVCache(g.AvgKVCachePct, colMGAvgKV)
+	queuePlain := formatQueue(g.TotalQueue, colMGQueue)
 	runningStr := padRight(fmt.Sprintf("%d", g.TotalRunning), colMGRunning)
-
-	var ttftStr string
-	if g.AvgTTFTP99 == 0 {
-		ttftStr = StyleMetricNA.Render(padRight("—", colMGAvgTTFT))
-	} else {
-		ttftStr = TTFTStyle(g.AvgTTFTP99).Render(padRight(fmt.Sprintf("%.0fms", g.AvgTTFTP99), colMGAvgTTFT))
-	}
-
-	var hitStr string
-	if g.AvgHitRate == 0 {
-		hitStr = StyleMetricNA.Render(padRight("—", colMGAvgHit))
-	} else {
-		hitStr = StyleMetricGood.Render(padRight(fmt.Sprintf("%.0f%%", g.AvgHitRate), colMGAvgHit))
-	}
+	ttftPlain := formatTTFT(g.AvgTTFTP99, colMGAvgTTFT)
+	hitPlain := formatHitRate(g.AvgHitRate, colMGAvgHit)
 
 	if selected {
-		plain := "  " + stripStyle(modelStr) + " " + stripStyle(backendStr) + " " +
-			workersStr + " " + stripStyle(tokStr) + " " + stripStyle(kvStr) + " " +
-			stripStyle(queueStr) + " " + runningStr + " " + stripStyle(ttftStr) + " " +
-			stripStyle(hitStr)
+		plain := "  " + modelStr + " " + backendPlain + " " +
+			workersStr + " " + tokPlain + " " + kvPlain + " " +
+			queuePlain + " " + runningStr + " " + ttftPlain + " " +
+			hitPlain
 		return StyleTableRowSelected.Render(plain)
 	}
 
-	return "  " + modelStr + " " + backendStr + " " + workersStr + " " +
-		tokStr + " " + kvStr + " " + queueStr + " " + runningStr + " " +
-		ttftStr + " " + hitStr
+	return "  " + modelStr + " " +
+		backendStyle(g.Backend).Render(backendPlain) + " " +
+		workersStr + " " +
+		tokPerSecStyle(g.TotalTokPerSec, tokPlain) + " " +
+		kvCacheStyle(g.AvgKVCachePct, kvPlain) + " " +
+		queueStyle(g.TotalQueue, queuePlain) + " " +
+		runningStr + " " +
+		ttftStyle(g.AvgTTFTP99, ttftPlain) + " " +
+		hitRateStyle(g.AvgHitRate, hitPlain)
 }

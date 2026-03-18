@@ -2,6 +2,7 @@
 package ui
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -33,6 +34,12 @@ type tickMsg time.Time
 // refreshMsg is sent on manual refresh request.
 type refreshMsg struct{}
 
+// exportDoneMsg signals that a JSON export completed.
+type exportDoneMsg struct {
+	filename string
+	err      error
+}
+
 // dataMsg carries a new set of worker metrics.
 type dataMsg struct {
 	workers    []*metrics.WorkerMetrics
@@ -56,8 +63,8 @@ var gpuSortCycle = []GPUSortColumn{GPUSortNone, GPUSortUtil, GPUSortVRAM, GPUSor
 
 // Model is the Bubbletea application model.
 type Model struct {
-	collector     *collector.Collector
-	dcgmCollector *collector.DCGMCollector
+	collector     collector.MetricsSource
+	dcgmCollector collector.GPUSource // nil when no GPU source
 	workers       []*metrics.WorkerMetrics
 	summary       metrics.FleetSummary
 	selectedIdx   int
@@ -107,7 +114,7 @@ var sortCycle = []SortColumn{
 }
 
 // NewModel creates a new application model.
-func NewModel(c *collector.Collector, dc *collector.DCGMCollector, version string, intervalSec int, k8sContext string) Model {
+func NewModel(c collector.MetricsSource, dc collector.GPUSource, version string, intervalSec int, k8sContext string) Model {
 	return Model{
 		collector:     c,
 		dcgmCollector: dc,
@@ -185,6 +192,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case exportDoneMsg:
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -192,7 +202,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func fetchDataCmd(c *collector.Collector, dc *collector.DCGMCollector) tea.Cmd {
+func fetchDataCmd(c collector.MetricsSource, dc collector.GPUSource) tea.Cmd {
 	return func() tea.Msg {
 		workers := c.GetAll()
 		summary := metrics.ComputeFleetSummary(workers)
@@ -202,6 +212,34 @@ func fetchDataCmd(c *collector.Collector, dc *collector.DCGMCollector) tea.Cmd {
 			msg.gpuSummary = dc.GetSummary()
 		}
 		return msg
+	}
+}
+
+func exportJSONCmd(workers []*metrics.WorkerMetrics, summary metrics.FleetSummary, gpus []*metrics.GPUInfo, gpuSummary metrics.GPUSummary) tea.Cmd {
+	return func() tea.Msg {
+		filename := fmt.Sprintf("llmtop-export-%s.json", time.Now().Format("20060102-150405"))
+		envelope := struct {
+			Summary     metrics.FleetSummary    `json:"summary"`
+			Workers     []*metrics.WorkerMetrics `json:"workers"`
+			ModelGroups []metrics.ModelGroup     `json:"model_groups,omitempty"`
+			GPUSummary  *metrics.GPUSummary      `json:"gpu_summary,omitempty"`
+			GPUs        []*metrics.GPUInfo       `json:"gpus,omitempty"`
+		}{
+			Summary:     summary,
+			Workers:     workers,
+			ModelGroups: metrics.GroupWorkersByModel(workers),
+		}
+		if len(gpus) > 0 {
+			s := gpuSummary
+			envelope.GPUSummary = &s
+			envelope.GPUs = gpus
+		}
+		data, err := json.MarshalIndent(envelope, "", "  ")
+		if err != nil {
+			return exportDoneMsg{err: err}
+		}
+		err = os.WriteFile(filename, data, 0o644)
+		return exportDoneMsg{filename: filename, err: err}
 	}
 }
 
@@ -269,14 +307,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "r":
-		m.collector.PollNow()
+		m.collector.PollNow(context.TODO())
 		if m.dcgmCollector != nil {
-			m.dcgmCollector.PollNow()
+			m.dcgmCollector.PollNow(context.TODO())
 		}
 		return m, fetchDataCmd(m.collector, m.dcgmCollector)
 
 	case "e":
-		go m.exportJSON()
+		return m, exportJSONCmd(m.workers, m.summary, m.gpus, m.gpuSummary)
 
 	case "g":
 		if m.dcgmCollector != nil {
@@ -336,14 +374,14 @@ func (m Model) handleModelGroupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "r":
-		m.collector.PollNow()
+		m.collector.PollNow(context.TODO())
 		if m.dcgmCollector != nil {
-			m.dcgmCollector.PollNow()
+			m.dcgmCollector.PollNow(context.TODO())
 		}
 		return m, fetchDataCmd(m.collector, m.dcgmCollector)
 
 	case "e":
-		go m.exportJSON()
+		return m, exportJSONCmd(m.workers, m.summary, m.gpus, m.gpuSummary)
 
 	case "?":
 		m.currentView = ViewHelp
@@ -408,14 +446,14 @@ func (m Model) handleGPUKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "r":
-		m.collector.PollNow()
+		m.collector.PollNow(context.TODO())
 		if m.dcgmCollector != nil {
-			m.dcgmCollector.PollNow()
+			m.dcgmCollector.PollNow(context.TODO())
 		}
 		return m, fetchDataCmd(m.collector, m.dcgmCollector)
 
 	case "e":
-		go m.exportJSON()
+		return m, exportJSONCmd(m.workers, m.summary, m.gpus, m.gpuSummary)
 
 	case "?":
 		m.currentView = ViewHelp
@@ -465,31 +503,6 @@ func (m *Model) sortWorkers() {
 		}
 		return false
 	})
-}
-
-func (m Model) exportJSON() {
-	filename := fmt.Sprintf("llmtop-export-%s.json", time.Now().Format("20060102-150405"))
-	envelope := struct {
-		Summary     metrics.FleetSummary    `json:"summary"`
-		Workers     []*metrics.WorkerMetrics `json:"workers"`
-		ModelGroups []metrics.ModelGroup    `json:"model_groups,omitempty"`
-		GPUSummary  *metrics.GPUSummary     `json:"gpu_summary,omitempty"`
-		GPUs        []*metrics.GPUInfo      `json:"gpus,omitempty"`
-	}{
-		Summary:     m.summary,
-		Workers:     m.workers,
-		ModelGroups: metrics.GroupWorkersByModel(m.workers),
-	}
-	if len(m.gpus) > 0 {
-		gpuSummary := m.gpuSummary
-		envelope.GPUSummary = &gpuSummary
-		envelope.GPUs = m.gpus
-	}
-	data, err := json.MarshalIndent(envelope, "", "  ")
-	if err != nil {
-		return
-	}
-	_ = os.WriteFile(filename, data, 0o644)
 }
 
 // View renders the current application state.
